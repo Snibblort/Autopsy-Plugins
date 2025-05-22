@@ -1,0 +1,160 @@
+import jarray
+import inspect
+from java.lang import System
+from java.util.logging import Level
+from org.sleuthkit.datamodel import SleuthkitCase
+from org.sleuthkit.datamodel import AbstractFile
+from org.sleuthkit.datamodel import ReadContentInputStream
+from org.sleuthkit.datamodel import BlackboardArtifact
+from org.sleuthkit.datamodel import BlackboardAttribute
+from org.sleuthkit.datamodel import TskData
+from org.sleuthkit.autopsy.ingest import IngestModule
+from org.sleuthkit.autopsy.ingest.IngestModule import IngestModuleException
+from org.sleuthkit.autopsy.ingest import DataSourceIngestModule
+from org.sleuthkit.autopsy.ingest import FileIngestModule
+from org.sleuthkit.autopsy.ingest import IngestModuleFactoryAdapter
+from org.sleuthkit.autopsy.ingest import IngestMessage
+from org.sleuthkit.autopsy.ingest import IngestServices
+from org.sleuthkit.autopsy.ingest import ModuleDataEvent
+from org.sleuthkit.autopsy.coreutils import Logger
+from org.sleuthkit.autopsy.casemodule import Case
+from org.sleuthkit.autopsy.casemodule.services import Services
+from org.sleuthkit.autopsy.casemodule.services import FileManager
+from org.sleuthkit.autopsy.casemodule.services import Blackboard
+from org.sleuthkit.datamodel import Score
+from java.util import Arrays
+from org.sleuthkit.datamodel import TskCoreException
+
+########################################################################################################
+#Module information... make sure to upade class names for the project.. Dont change the layout
+class FileSizeCounterFactory(IngestModuleFactoryAdapter):
+
+    moduleName = "File Size Counter"
+
+    def getModuleDisplayName(self):
+        return self.moduleName
+
+    def getModuleDescription(self):
+        return "Determines the File sizes"
+
+    def getModuleVersionNumber(self):
+        return "1.0"
+
+    # Return true if module wants to get called for each file
+    def isFileIngestModuleFactory(self):
+        return True
+
+    # can return null if isFileIngestModuleFactory returns false
+    def createFileIngestModule(self, ingestOptions):
+        return FileSizeCounterModule()
+    
+########################################################################################################
+#PREP
+# File-level ingest module.  One gets created per thread.
+class FileSizeCounterModule(FileIngestModule):
+    #FileSizeCounterFactory.moduleName is a string like "Big Round File Finder" defined in your IngestModuleFactory — it helps organize log messages by source.
+    _logger = Logger.getLogger(FileSizeCounterFactory.moduleName)
+
+    #Adds context to my logs for example self.log(Level.INFO, "Found a big file") ---> INFO: [FileSizeCounterModule.process] Found a big file
+    def log(self, level, msg):
+        self._logger.logp(level, self.__class__.__name__, inspect.stack()[1][3], msg)
+
+    def __init__(self):
+        self.context = None
+
+    #Used to setup the stage... Also used to see if the job was canceled...
+    def startUp(self, context):
+        self.context = context
+        self.filesFound = 0
+
+        #Getting current case... 
+        current_case = Case.getCurrentCase()
+        #Getting File manager
+        file_manager = Services.getFileManager()
+        # This gets the forensic data model needed to create artifacts and attributes
+        sleuthkit_case = current_case.getSleuthkitCase()
+
+        #Making Custom Artifacts
+        #Interal Unique Name
+        ARTIFACT_TYPE_NAME = "TSK_FILE_SIZE_CATEGORY"
+        #User Friendly Display Name
+        ARTIFACT_TYPE_DISPLAY_NAME = "File Size Category"
+
+        #Checking if the artifact already Exists
+        try:
+            self.fileSizeCategoryArtifactType = sleuthkit_case.getArtifactType(ARTIFACT_TYPE_NAME)
+        except TskCoreException:
+            self.fileSizeCategoryArtifactType = sleuthkit_case.addArtifactType(ARTIFACT_TYPE_NAME, ARTIFACT_TYPE_DISPLAY_NAME)
+        
+        #Looking for TSK_Category, if it doesn't exist I create it... This is going to store my custom artifacts
+        try:
+            self.fileSizeCategoryAttrType = sleuthkit_case.getAttributeType("TSK_CATEGORY")
+        except TskCoreException:
+            self.fileSizeCategoryAttrType = sleuthkit_case.addAttributeType("TSK_CATEGORY",BlackboardAttribute.TSK_BLACKBOARD_ATTRIBUTE_VALUE_TYPE.STRING,"File size category")    
+        
+        #Looks for TSK_FILE_SIZE if it doesnt exist it makes it... This is going to show the exact amount of bytes a file is...
+        try:
+            self.fileSizeSizeAttrType = sleuthkit_case.getAttributeType("TSK_FILE_SIZE")
+        except TskCoreException:
+            self.fileSizeSizeAttrType = sleuthkit_case.addAttributeType("TSK_FILE_SIZE",BlackboardAttribute.TSK_BLACKBOARD_ATTRIBUTE_VALUE_TYPE.LONG,"File size in bytes")
+        
+        #\/ Everything is for a progress bar in this class below this line
+        #Getting all the files in the case...... % = basically anything that has any character
+        all_files = file_manager.findFiles(current_case.getSleuthkitCase(), "%")
+
+        #Store total number of files
+        self.totalFiles = len(all_files)
+
+        self.log(Level.INFO, f"Total Files: {self.totalFiles}")
+########################################################################################################
+
+    def process(self, file):
+
+        # Gets currents case --> Gets Skeuthkit Case object which gives me forensic data model --> Gets Blackboard (Which is used to display)
+        blackboard = Case.getCurrentCase().getSleuthkitCase().getBlackboard()
+
+        # Skips non-files
+        if ((file.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.UNALLOC_BLOCKS) or 
+            (file.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.UNUSED_BLOCKS) or 
+            (file.isFile() == False)):
+            return IngestModule.ProcessResult.OK
+        
+        SMALL_FILE_MAX = 1048576 # 1 MB
+        MEDIUM_FILE_MAX =104857600 # 10 MB
+        LARGE_FILE_MAX = 10485759999 #Just before 10 GB
+ 
+        #Getting file size
+        size = file.getSize()
+        category = ""
+
+        #Categorizing the file by size
+        if size <= SMALL_FILE_MAX:
+            category = "Small"
+        elif size <= MEDIUM_FILE_MAX:
+            category = "Medium"
+        elif size <= LARGE_FILE_MAX:
+            category = "Large"
+        else:
+            category = "Extra Large"
+        
+        #Counts how many files we have went through
+        self.filesFound += 1
+        #Math for the progress bar... The end prevents a crash is there is 0 files...
+        progress = int(self.filesFound / self.totalFiles * 100) if self.totalFiles else 100
+        
+        IngestServices.getInstance().setProgress(self.context, progress)
+        try:
+            #Creating custom artifact
+            artifact = file.newArtifact(self.fileSizeCategoryArtifactType.getTypeID())
+
+            #Makes Module based on Category name
+            artifact.addAttribute(BlackboardAttribute(self.fileSizeCategoryAttrType, FileSizeCounterFactory.moduleName, category))
+
+            #This is for the number of bytes the file is...
+            artifact.addAttribute(BlackboardAttribute(self.fileSizeSizeAttrType, FileSizeCounterFactory.moduleName, size))
+
+            #Makes the results actually viewable *IMPORTANT*
+            blackboard.postArtifact(artifact, FileSizeCounterFactory.moduleName)
+        #Error handling
+        except Exception as e:
+            self.log(Level.SEVERE, "Error adding file size artifact: " + str(e))
